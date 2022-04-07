@@ -1,41 +1,33 @@
-import math, shutil, os, time, argparse
-import numpy as np
-import scipy.io as sio
+""" ===================================================================================================================
+Train/test code for a modified iTracker where estimated head pose values are added as a new input.
 
-import torch
-import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
+Author: Petr Kellnhofer (pkellnho@gmail.com), 2018.
 
-from ITrackerData import ITrackerData
-from ITrackerModel import ITrackerModel
-
-'''
-Train/test code for iTracker.
-
-Author: Petr Kellnhofer ( pkel_lnho (at) gmai_l.com // remove underscores and spaces), 2018. 
+Modified: Thomas Gibson (tjg1g19@soton.ac.uk), 2022.
 
 Website: http://gazecapture.csail.mit.edu/
 
-Cite:
-
-Eye Tracking for Everyone
+Original Paper: Eye Tracking for Everyone
 K.Krafka*, A. Khosla*, P. Kellnhofer, H. Kannan, S. Bhandarkar, W. Matusik and A. Torralba
 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016
 
-@inproceedings{cvpr2016_gazecapture,
-Author = {Kyle Krafka and Aditya Khosla and Petr Kellnhofer and Harini Kannan and Suchendra Bhandarkar and Wojciech Matusik and Antonio Torralba},
-Title = {Eye Tracking for Everyone},
-Year = {2016},
-Booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}
-}
+Date: 05/04/2022
+====================================================================================================================="""
 
-'''
+import argparse
+import os
+import shutil
+import time
+
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+from ITrackerData import ITrackerData
+from ITrackerModel import ITrackerModel
 
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -55,11 +47,11 @@ args = parser.parse_args()
 doLoad = not args.reset # Load checkpoint at the beginning
 doTest = args.sink # Only run test, no training
 
-workers = 16
+workers = 8
 epochs = 25
-batch_size = torch.cuda.device_count()*100 # Change if out of cuda memory
+batch_size = 1 * 64 # Change if out of cuda memory
 
-base_lr = 0.0001
+base_lr = 0.001
 momentum = 0.9
 weight_decay = 1e-4
 print_freq = 10
@@ -71,7 +63,6 @@ count_test = 0
 count = 0
 
 
-
 def main():
     global args, best_prec1, weight_decay, momentum
 
@@ -79,7 +70,7 @@ def main():
     model = torch.nn.DataParallel(model)
     model.cuda()
     imSize=(224,224)
-    cudnn.benchmark = True   
+    cudnn.benchmark = True
 
     epoch = 0
     if doLoad:
@@ -96,10 +87,10 @@ def main():
         else:
             print('Warning: Could not read checkpoint!')
 
-    
+
     dataTrain = ITrackerData(dataPath = args.data_path, split='train', imSize = imSize)
     dataVal = ITrackerData(dataPath = args.data_path, split='test', imSize = imSize)
-   
+
     train_loader = torch.utils.data.DataLoader(
         dataTrain,
         batch_size=batch_size, shuffle=True,
@@ -109,7 +100,6 @@ def main():
         dataVal,
         batch_size=batch_size, shuffle=False,
         num_workers=workers, pin_memory=True)
-
 
     criterion = nn.MSELoss().cuda()
 
@@ -124,7 +114,7 @@ def main():
 
     for epoch in range(0, epoch):
         adjust_learning_rate(optimizer, epoch)
-        
+
     for epoch in range(epoch, epochs):
         adjust_learning_rate(optimizer, epoch)
 
@@ -149,14 +139,15 @@ def train(train_loader, model, criterion,optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    accuracy_x = AverageMeter()
+    accuracy_y = AverageMeter()
 
     # switch to train mode
     model.train()
 
     end = time.time()
 
-    for i, (row, imFace, imEyeL, imEyeR, faceGrid, gaze) in enumerate(train_loader):
-        
+    for i, (row, imFace, imEyeL, imEyeR, faceGrid, gaze, headPose) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
         imFace = imFace.cuda()
@@ -164,18 +155,27 @@ def train(train_loader, model, criterion,optimizer, epoch):
         imEyeR = imEyeR.cuda()
         faceGrid = faceGrid.cuda()
         gaze = gaze.cuda()
-        
+        headPose = headPose.cuda()
+
         imFace = torch.autograd.Variable(imFace, requires_grad = True)
         imEyeL = torch.autograd.Variable(imEyeL, requires_grad = True)
         imEyeR = torch.autograd.Variable(imEyeR, requires_grad = True)
         faceGrid = torch.autograd.Variable(faceGrid, requires_grad = True)
+        headPose = torch.autograd.Variable(headPose, requires_grad = True)
         gaze = torch.autograd.Variable(gaze, requires_grad = False)
 
         # compute output
-        output = model(imFace, imEyeL, imEyeR, faceGrid)
+        output = model(imFace, imEyeL, imEyeR, faceGrid, headPose)
+
+        outputnp = output.cpu().detach().numpy()
+        outputc = outputnp.copy()
+        gazenp = gaze.cpu().detach().numpy()
+        gazec = gazenp.copy()
+        batch_accuracy = abs(outputc - gazec)
+        accuracy_x.update(np.mean(batch_accuracy, axis=0)[0])
+        accuracy_y.update(np.mean(batch_accuracy, axis=0)[1])
 
         loss = criterion(output, gaze)
-        
         losses.update(loss.data.item(), imFace.size(0))
 
         # compute gradient and do SGD step
@@ -192,9 +192,12 @@ def train(train_loader, model, criterion,optimizer, epoch):
         print('Epoch (train): [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'X Axis Accuracy {accuracy_x.avg:.3f}\t'
+                  'Y Axis Accuracy {accuracy_y.avg:.3f}\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses))
+                   data_time=data_time, accuracy_x=accuracy_x, accuracy_y=accuracy_y, loss=losses), flush=True)
+
 
 def validate(val_loader, model, criterion, epoch):
     global count_test
@@ -202,6 +205,8 @@ def validate(val_loader, model, criterion, epoch):
     data_time = AverageMeter()
     losses = AverageMeter()
     lossesLin = AverageMeter()
+    accuracy_x = AverageMeter()
+    accuracy_y = AverageMeter()
 
     # switch to evaluate mode
     model.eval()
@@ -209,27 +214,37 @@ def validate(val_loader, model, criterion, epoch):
 
 
     oIndex = 0
-    for i, (row, imFace, imEyeL, imEyeR, faceGrid, gaze) in enumerate(val_loader):
+    for i, (row, imFace, imEyeL, imEyeR, faceGrid, gaze, headPose) in enumerate(val_loader):
         # measure data loading time
         data_time.update(time.time() - end)
         imFace = imFace.cuda()
         imEyeL = imEyeL.cuda()
         imEyeR = imEyeR.cuda()
         faceGrid = faceGrid.cuda()
+        headPose = headPose.cuda()
         gaze = gaze.cuda()
-        
+
         imFace = torch.autograd.Variable(imFace, requires_grad = False)
         imEyeL = torch.autograd.Variable(imEyeL, requires_grad = False)
         imEyeR = torch.autograd.Variable(imEyeR, requires_grad = False)
         faceGrid = torch.autograd.Variable(faceGrid, requires_grad = False)
+        headPose = torch.autograd.Variable(headPose, requires_grad = False)
         gaze = torch.autograd.Variable(gaze, requires_grad = False)
 
         # compute output
         with torch.no_grad():
-            output = model(imFace, imEyeL, imEyeR, faceGrid)
+            output = model(imFace, imEyeL, imEyeR, faceGrid, headPose)
+
+        outputnp = output.cpu().detach().numpy()
+        outputc = outputnp.copy()
+        gazenp = gaze.cpu().detach().numpy()
+        gazec = gazenp.copy()
+        batch_accuracy = abs(outputc - gazec)
+        accuracy_x.update(np.mean(batch_accuracy, axis=0)[0])
+        accuracy_y.update(np.mean(batch_accuracy, axis=0)[1])
 
         loss = criterion(output, gaze)
-        
+
         lossLin = output - gaze
         lossLin = torch.mul(lossLin,lossLin)
         lossLin = torch.sum(lossLin,1)
@@ -237,31 +252,35 @@ def validate(val_loader, model, criterion, epoch):
 
         losses.update(loss.data.item(), imFace.size(0))
         lossesLin.update(lossLin.item(), imFace.size(0))
-     
+
         # compute gradient and do SGD step
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
-
         print('Epoch (val): [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Error L2 {lossLin.val:.4f} ({lossLin.avg:.4f})\t'.format(
-                    epoch, i, len(val_loader), batch_time=batch_time,
-                   loss=losses,lossLin=lossesLin))
+              'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+              'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+              'X Axis Accuracy {accuracy_x.avg:.3f}\t'
+              'Y Axis Accuracy {accuracy_y.avg:.3f}\t'
+              'Error L2 {lossLin.val:.4f} ({lossLin.avg:.4f})\t'.format(
+            epoch, i, len(val_loader), batch_time=batch_time,
+            loss=losses,lossLin=lossesLin, accuracy_x=accuracy_x, accuracy_y=accuracy_y), flush=True)
 
     return lossesLin.avg
 
+
 CHECKPOINTS_PATH = '.'
 
-def load_checkpoint(filename='checkpoint.pth.tar'):
+
+def load_checkpoint(filename='best_checkpoint.pth.tar'):
     filename = os.path.join(CHECKPOINTS_PATH, filename)
     print(filename)
     if not os.path.isfile(filename):
         return None
     state = torch.load(filename)
     return state
+
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     if not os.path.isdir(CHECKPOINTS_PATH):

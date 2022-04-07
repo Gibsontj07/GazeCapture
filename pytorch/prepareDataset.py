@@ -1,36 +1,35 @@
-import math, shutil, os, time, argparse, json, re, sys
-import numpy as np
-import scipy.io as sio
-from PIL import Image
+""" ===================================================================================================================
+Dataset preparation script for a modified iTracker where estimated head pose values are added as a new input.
 
+Author: Petr Kellnhofer (pkellnho@gmail.com), 2018.
 
-'''
-Prepares the GazeCapture dataset for use with the pytorch code. Crops images, compiles JSONs into metadata.mat
-
-Author: Petr Kellnhofer ( pkel_lnho (at) gmai_l.com // remove underscores and spaces), 2018. 
+Modified: Thomas Gibson (tjg1g19@soton.ac.uk), 2022.
 
 Website: http://gazecapture.csail.mit.edu/
 
-Cite:
-
-Eye Tracking for Everyone
+Original Paper: Eye Tracking for Everyone
 K.Krafka*, A. Khosla*, P. Kellnhofer, H. Kannan, S. Bhandarkar, W. Matusik and A. Torralba
 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016
 
-@inproceedings{cvpr2016_gazecapture,
-Author = {Kyle Krafka and Aditya Khosla and Petr Kellnhofer and Harini Kannan and Suchendra Bhandarkar and Wojciech Matusik and Antonio Torralba},
-Title = {Eye Tracking for Everyone},
-Year = {2016},
-Booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}
-}
+Date: 05/04/2022
+====================================================================================================================="""
 
-'''
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import dlib
+import headPose
+import numpy as np
+import scipy.io as sio
+from PIL import Image
 
 parser = argparse.ArgumentParser(description='iTracker-pytorch-PrepareDataset.')
 parser.add_argument('--dataset_path', help="Path to extracted files. It should have folders called '%%05d' in it.")
 parser.add_argument('--output_path', default=None, help="Where to write the output. Can be the same as dataset_path if you wish (=default).")
 args = parser.parse_args()
-
 
 
 def main():
@@ -44,7 +43,7 @@ def main():
 
     # list recordings
     recordings = os.listdir(args.dataset_path)
-    recordings = np.array(recordings, np.object)
+    recordings = np.array(recordings, object)
     recordings = recordings[[os.path.isdir(os.path.join(args.dataset_path, r)) for r in recordings]]
     recordings.sort()
 
@@ -55,7 +54,11 @@ def main():
         'labelDotXCam': [],
         'labelDotYCam': [],
         'labelFaceGrid': [],
+        'headPose': [],
     }
+
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
     for i,recording in enumerate(recordings):
         print('[%d/%d] Processing recording %s (%.2f%%)' % (i, len(recordings), recording, i / len(recordings) * 100))
@@ -118,7 +121,7 @@ def main():
             if not os.path.isfile(imgFile):
                 logError('Warning: Could not read image file %s!' % imgFile)
                 continue
-            img = Image.open(imgFile)        
+            img = Image.open(imgFile)
             if img is None:
                 logError('Warning: Could not read image file %s!' % imgFile)
                 continue
@@ -128,6 +131,15 @@ def main():
             imFace = cropImage(img, faceBbox[j,:])
             imEyeL = cropImage(img, leftEyeBbox[j,:])
             imEyeR = cropImage(img, rightEyeBbox[j,:])
+
+            headPose2d = []
+
+            # Detect Head Pose
+            try:
+                landmarks = headPose.detect_facial_landmarks(img, detector, predictor)
+                headPose2d = headPose.estimate_head_pose(landmarks)
+            except:
+                continue
 
             # Save images
             Image.fromarray(imFace).save(os.path.join(facePath, '%05d.jpg' % frame), quality=95)
@@ -140,6 +152,7 @@ def main():
             meta['labelDotXCam'] += [dotInfo['XCam'][j]]
             meta['labelDotYCam'] += [dotInfo['YCam'][j]]
             meta['labelFaceGrid'] += [faceGridBbox[j,:]]
+            meta['headPose'] += [headPose2d.tolist()]
 
     
     # Integrate
@@ -148,6 +161,7 @@ def main():
     meta['labelDotXCam'] = np.stack(meta['labelDotXCam'], axis = 0)
     meta['labelDotYCam'] = np.stack(meta['labelDotYCam'], axis = 0)
     meta['labelFaceGrid'] = np.stack(meta['labelFaceGrid'], axis = 0).astype(np.uint8)
+    meta['headPose'] = np.stack(meta['headPose'], axis = 0)
 
     # Load reference metadata
     print('Will compare to the reference GitHub dataset metadata.mat...')
@@ -180,9 +194,9 @@ def main():
             #break
 
     # Copy split from reference
-    meta['labelTrain'] = np.zeros((len(meta['labelRecNum'],)),np.bool)
-    meta['labelVal'] = np.ones((len(meta['labelRecNum'],)),np.bool) # default choice
-    meta['labelTest'] = np.zeros((len(meta['labelRecNum'],)),np.bool)
+    meta['labelTrain'] = np.zeros((len(meta['labelRecNum'],)), bool)
+    meta['labelVal'] = np.ones((len(meta['labelRecNum'],)), bool) # default choice
+    meta['labelTest'] = np.zeros((len(meta['labelRecNum'],)), bool)
 
     validMappingMask = mToR >= 0
     meta['labelTrain'][validMappingMask] = reference['labelTrain'][mToR[validMappingMask]]
@@ -198,7 +212,7 @@ def main():
     nMissing = np.sum(rToM < 0)
     nExtra = np.sum(mToR < 0)
     totalMatch = len(mKey) == len(rKey) and np.all(np.equal(mKey, rKey))
-    print('======================\n\tSummary\n======================')    
+    print('======================\n\tSummary\n======================')
     print('Total added %d frames from %d recordings.' % (len(meta['frameIndex']), len(np.unique(meta['labelRecNum']))))
     if nMissing > 0:
         print('There are %d frames missing in the new dataset. This may affect the results. Check the log to see which files are missing.' % nMissing)
@@ -210,11 +224,6 @@ def main():
         print('There are no extra files that were not in the reference dataset.')
     if totalMatch:
         print('The new metadata.mat is an exact match to the reference from GitHub (including ordering)')
-
-    #import pdb; pdb.set_trace()
-    input("Press Enter to continue...")
-
-
 
 
 def readJson(filename):
@@ -272,3 +281,4 @@ def cropImage(img, bbox):
 if __name__ == "__main__":
     main()
     print('DONE')
+
