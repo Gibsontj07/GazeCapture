@@ -22,6 +22,7 @@ import os.path
 import torchvision.transforms as transforms
 import torch
 import numpy as np
+import cv2 as cv2
 
 MEAN_PATH = './'
 
@@ -71,24 +72,24 @@ class ITrackerData(data.Dataset):
         if self.metadata is None:
             raise RuntimeError('Could not read metadata file %s! Provide a valid dataset path.' % metaFile)
 
-        self.faceMean = loadMetadata(os.path.join(MEAN_PATH, 'mean_face_224.mat'))['image_mean']
+        self.faceMean = loadMetadata(os.path.join(MEAN_PATH, 'mean_face_224_dots.mat'))['image_mean']
         self.eyeLeftMean = loadMetadata(os.path.join(MEAN_PATH, 'mean_left_224.mat'))['image_mean']
         self.eyeRightMean = loadMetadata(os.path.join(MEAN_PATH, 'mean_right_224.mat'))['image_mean']
 
         self.transformFace = transforms.Compose([
             transforms.Resize(self.imSize),
-            transforms.ToTensor(),
-            SubtractMean(meanImg=self.faceMean)
+            # transforms.ToTensor(),
+            # SubtractMean(meanImg=self.faceMean)
         ])
         self.transformEyeL = transforms.Compose([
             transforms.Resize(self.imSize),
-            transforms.ToTensor(),
-            SubtractMean(meanImg=self.eyeLeftMean),
+            # transforms.ToTensor(),
+            # SubtractMean(meanImg=self.eyeLeftMean),
         ])
         self.transformEyeR = transforms.Compose([
             transforms.Resize(self.imSize),
-            transforms.ToTensor(),
-            SubtractMean(meanImg=self.eyeRightMean),
+            # transforms.ToTensor(),
+            # SubtractMean(meanImg=self.eyeRightMean),
         ])
 
         if split == 'test':
@@ -141,19 +142,23 @@ class ITrackerData(data.Dataset):
         imEyeL = self.transformEyeL(imEyeL)
         imEyeR = self.transformEyeR(imEyeR)
 
+        imFace = np.array(imFace)
+        imEyeL = np.array(imEyeL)
+        imEyeR = np.array(imEyeR)
+
         gaze = np.array([self.metadata['labelDotXCam'][index], self.metadata['labelDotYCam'][index]], np.float32)
 
         faceGrid = self.makeGrid(self.metadata['labelFaceGrid'][index, :])
 
-        headPose = np.array(self.metadata['headPose'][index], np.float32)
+        # headPose = np.array(self.metadata['headPose'][index], np.float32)
 
         # to tensor
         row = torch.LongTensor([int(index)])
         faceGrid = torch.FloatTensor(faceGrid)
         gaze = torch.FloatTensor(gaze)
-        headPose = torch.FloatTensor(headPose)
+        # headPose = torch.FloatTensor(headPose)
 
-        return row, imFace, imEyeL, imEyeR, faceGrid, gaze, headPose
+        return row, imFace, imEyeL, imEyeR, faceGrid, gaze #, headPose
 
     def __len__(self):
         return len(self.indices)
